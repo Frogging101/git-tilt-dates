@@ -93,6 +93,7 @@ argparser.add_argument("--ref")
 argparser.add_argument("--offset", type=parse_offset, required=True)
 argparser.add_argument("--preserve-commit-date", action="store_true", default=False)
 argparser.add_argument("--modify-commit-date", action="store_true", default=False)
+argparser.add_argument("--commit-date-only", action="store_true", default=False)
 argparser.add_argument("--tz", default='')
 
 args = argparser.parse_args()
@@ -149,17 +150,18 @@ def off_to_tzinfo(off):
 
 adate = gitdate_to_pair(adate, "GIT_AUTHOR_DATE")
 cdate = gitdate_to_pair(cdate, "GIT_COMMITTER_DATE")
-if {mod_cdate}:
+if {mod_cdate} or {cdate_only}:
     cdate[0] = modify_timestamp(cdate[0], delta)
 elif not {keep_cdate}:
     tzinfo = off_to_tzinfo(cdate[1])
     cdate = [int(datetime.datetime.now(tzinfo).timestamp()), cdate[1]]
 
-adate[0] = modify_timestamp(adate[0], delta)
+if not {cdate_only}:
+    adate[0] = modify_timestamp(adate[0], delta)
 print("export GIT_AUTHOR_DATE='{{}} {{}}' GIT_COMMITTER_DATE='{{}} {{}}'".format(
           adate[0], adate[1], cdate[0], cdate[1]))
 """.format(offset=offset, tz=args.tz, mod_cdate=args.modify_commit_date,
-           keep_cdate=args.preserve_commit_date)
+           keep_cdate=args.preserve_commit_date, cdate_only=args.commit_date_only)
 
     scriptfile,tmp = tempfile.mkstemp(".py", "git_tilt_dates_env_filter_")
     os.write(scriptfile, script.encode())
