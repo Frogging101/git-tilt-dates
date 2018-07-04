@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import argparse
+import datetime
 import os
 import subprocess
 import sys
@@ -14,6 +15,29 @@ unit_muls = {'s': 1,
              'w': 1 * 60 * 60 * 24 * 7,
              'y': 1 * 60 * 60 * 24 * 365}
 
+def isodate_to_unix(datestr):
+    tryformats = ("%Y-%m-%dT%H:%M:%S%z",
+                  "%Y-%m-%dT%H:%M:%S",
+                  "%Y-%m-%dT%H:%M:%SZ",
+                  "%Y-%m-%d %H:%M:%S%z",
+                  "%Y-%m-%d %H:%M:%S",
+                  "%Y-%m-%d %H:%M:%SZ")
+    parsed = False
+    for fmt in tryformats:
+        try:
+            dt = datetime.datetime.strptime(datestr, fmt)
+            parsed = True
+            break
+        except ValueError:
+            continue
+    if not parsed:
+        print("Failed to parse ISO date", datestr, file=sys.stderr)
+        sys.exit(1)
+
+    if datestr[-1] == 'Z':
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int(dt.timestamp())
+
 def parse_offset(offset_str):
     offsetlen = len(offset_str)
     if offsetlen < 2:
@@ -21,9 +45,14 @@ def parse_offset(offset_str):
         return None
 
     sign = offset_str[0]
-    if sign not in ('+','-'):
-        print("Sign must be + or -")
+    if sign not in ('+','-','='):
+        print("Sign must be one of + - =")
         return None
+
+    if sign == '=':
+        datestr = offset_str[1:]
+        return '='+str(isodate_to_unix(datestr))
+
     sign = sign == '+' # True if sign is positive
 
     i = 1
@@ -56,7 +85,7 @@ def parse_offset(offset_str):
     if not sign:
         offset_sec = -offset_sec
 
-    return offset_sec
+    return str(offset_sec)
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument("rev_list", metavar='rev-list', nargs='+')
@@ -72,9 +101,17 @@ def build_date_filter(offset):
     script = """#!/usr/bin/python3
 
 import os,sys,datetime
-offset = {offset}
+delta = "{offset}"
 adate = os.environ["GIT_AUTHOR_DATE"]
 cdate = os.environ["GIT_COMMITTER_DATE"]
+
+def modify_timestamp(ts, delta):
+    if delta[0] == '-':
+        return ts - int(delta[1:])
+    if delta[0] == '+':
+        return ts + int(delta[1:])
+    if delta[0] == '=':
+        return int(delta[1:])
 
 def gitdate_to_pair(gitdate, env):
     if len(gitdate) < 1:
@@ -113,12 +150,12 @@ def off_to_tzinfo(off):
 adate = gitdate_to_pair(adate, "GIT_AUTHOR_DATE")
 cdate = gitdate_to_pair(cdate, "GIT_COMMITTER_DATE")
 if {mod_cdate}:
-    cdate[0] += offset
+    cdate[0] = modify_timestamp(cdate[0], delta)
 elif not {keep_cdate}:
     tzinfo = off_to_tzinfo(cdate[1])
     cdate = [int(datetime.datetime.now(tzinfo).timestamp()), cdate[1]]
 
-adate[0] += offset
+adate[0] = modify_timestamp(adate[0], delta)
 print("export GIT_AUTHOR_DATE='{{}} {{}}' GIT_COMMITTER_DATE='{{}} {{}}'".format(
           adate[0], adate[1], cdate[0], cdate[1]))
 """.format(offset=offset, tz=args.tz, mod_cdate=args.modify_commit_date,
