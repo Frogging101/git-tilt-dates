@@ -1,0 +1,167 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+from time import sleep
+
+unit_muls = {'s': 1,
+             'm': 1 * 60,
+             'h': 1 * 60 * 60,
+             'd': 1 * 60 * 60 * 24,
+             'w': 1 * 60 * 60 * 24 * 7,
+             'y': 1 * 60 * 60 * 24 * 365}
+
+def parse_offset(offset_str):
+    offsetlen = len(offset_str)
+    if offsetlen < 2:
+        print("Offset argument too short")
+        return None
+
+    sign = offset_str[0]
+    if sign not in ('+','-'):
+        print("Sign must be + or -")
+        return None
+    sign = sign == '+' # True if sign is positive
+
+    i = 1
+    offset_sec = 0
+    while i < offsetlen:
+        c = offset_str[i]
+        if c in ('+','-'):
+            print("Sign must be the first character")
+            return None
+
+        numbuf = ''
+        unit = ''
+        while c.isnumeric():
+            numbuf += c
+            i += 1
+            if i >= offsetlen:
+                unit = 's'
+                break
+            c = offset_str[i]
+        if not numbuf:
+            print("Expected number before '"+c+"'")
+            return None
+        num = int(numbuf)
+
+        if not unit:
+            unit = c
+        offset_sec += num * unit_muls[unit]
+        i += 1
+
+    if not sign:
+        offset_sec = -offset_sec
+
+    return offset_sec
+
+argparser = argparse.ArgumentParser()
+argparser.add_argument("rev_list", metavar='rev-list', nargs='+')
+argparser.add_argument("--ref")
+argparser.add_argument("--offset", type=parse_offset, required=True)
+argparser.add_argument("--preserve-commit-date", action="store_true", default=False)
+argparser.add_argument("--modify-commit-date", action="store_true", default=False)
+argparser.add_argument("--tz", default='')
+
+args = argparser.parse_args()
+
+def build_date_filter(offset):
+    script = """#!/usr/bin/python3
+
+import os,sys,datetime
+offset = {offset}
+adate = os.environ["GIT_AUTHOR_DATE"]
+cdate = os.environ["GIT_COMMITTER_DATE"]
+
+def gitdate_to_pair(gitdate, env):
+    if len(gitdate) < 1:
+        raise ValueError(env+" is empty")
+    i = 1
+    if gitdate[0] != '@':
+        print(env+" ("+gitdate+") is weird; should start with @",
+              file=sys.stderr)
+        i = 0
+    c = gitdate[i]
+    unixtime = ''
+    while c.isnumeric():
+        unixtime += c
+        i += 1; c = gitdate[i]
+    unixtime = int(unixtime)
+    while c.isspace():
+        i += 1; c = gitdate[i]
+    if c not in ('+','-'):
+        raise ValueError(env+" ("+gitdate+") has invalid offset sign "+c)
+    tzoffsign = c
+    i += 1; c = gitdate[i]
+    tzoff = tzoffsign
+    while c.isnumeric() and i < len(gitdate):
+        c = gitdate[i]
+        tzoff += c
+        i += 1
+    if "{tz}":
+        tzoff = "{tz}"
+    return [unixtime, tzoff]
+
+def off_to_tzinfo(off):
+    sign = -1 if off[0] == '-' else 1
+    delta = datetime.timedelta(hours=sign*int(off[1:3]),minutes=int(off[3:5]))
+    return datetime.timezone(delta)
+
+adate = gitdate_to_pair(adate, "GIT_AUTHOR_DATE")
+cdate = gitdate_to_pair(cdate, "GIT_COMMITTER_DATE")
+if {mod_cdate}:
+    cdate[0] += offset
+elif not {keep_cdate}:
+    tzinfo = off_to_tzinfo(cdate[1])
+    cdate = [int(datetime.datetime.now(tzinfo).timestamp()), cdate[1]]
+
+adate[0] += offset
+print("export GIT_AUTHOR_DATE='{{}} {{}}' GIT_COMMITTER_DATE='{{}} {{}}'".format(
+          adate[0], adate[1], cdate[0], cdate[1]))
+""".format(offset=offset, tz=args.tz, mod_cdate=args.modify_commit_date,
+           keep_cdate=args.preserve_commit_date)
+
+    scriptfile,tmp = tempfile.mkstemp(".py", "git_tilt_dates_env_filter_")
+    os.write(scriptfile, script.encode())
+    os.chmod(scriptfile, 0o755)
+    os.close(scriptfile)
+    return ("eval $({})".format(tmp), tmp)
+
+if __name__ == "__main__":
+    env_filter = build_date_filter(args.offset)
+    fbargs = ['git', 'filter-branch', '-f', '--env-filter', env_filter[0]]
+    revs = subprocess.check_output(
+        ["git", "rev-parse", "--symbolic-full-name"]+args.rev_list)
+    partial = False
+    if not len(revs):
+        if not args.ref:
+            print("--ref must be provided when rewriting a partial range",
+                  file=sys.stderr)
+            sys.exit(1)
+        else:
+            args.ref = subprocess.check_output(
+                ("git", "rev-parse", "--verify", "--symbolic-full-name",
+                 "--abbrev-ref", args.ref)).rstrip()
+        partial = True
+        revs = subprocess.check_output(
+            ["git", "rev-parse"]+args.rev_list).decode().splitlines()
+        branch_point = revs[0]
+        subprocess.check_call(("git", "checkout", "-B", "__tmp", branch_point))
+        fbargs.extend(revs[1:])
+        fbargs.append("HEAD")
+    else:
+        fbargs.extend(args.rev_list)
+
+    subprocess.check_call(fbargs)
+    os.remove(env_filter[1])
+
+    if partial:
+        os.system("git replace -f {} $(git rev-parse --verify @)".format(branch_point))
+        subprocess.check_call(("git", "filter-branch", "-f",
+                               "{}~..{}".format(branch_point, args.ref.decode())))
+        subprocess.check_call(("git", "replace", "-d", branch_point))
+        subprocess.check_call(("git", "checkout", args.ref))
+        subprocess.check_call(("git", "branch", "-d", "__tmp"))
